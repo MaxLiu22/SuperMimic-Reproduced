@@ -1,17 +1,56 @@
-"""Per-environment simulation context xi (plan: 33-d = foot friction 1 + encoder bias 29 + torso COM offset 3)."""
+"""Per-environment simulation context xi.
+
+xi = [foot friction(1), encoder bias(nj), torso COM offset(3)]
+
+Dimensions are now parameterized via RobotConfig for multi-robot support.
+"""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
+if TYPE_CHECKING:
+    from supermimic.robot.robot_config import RobotConfig
+
+# Legacy constant for backward compatibility (G1: 1 + 29 + 3 = 33)
 XI_DIM = 33
 
 
+def get_xi_dim(robot_cfg: "RobotConfig | None" = None) -> int:
+    """Get xi dimension for a robot config."""
+    if robot_cfg is None:
+        return XI_DIM
+    return robot_cfg.xi_dim
+
+
 class SimContext:
-    def __init__(self, env, foot_geom_regex: str, com_body_name: str = "torso_link", entity_name: str = "robot"):
+    """Per-environment simulation context with robot-parameterized dimensions.
+    
+    Args:
+        env: The mjlab environment
+        foot_geom_regex: Regex pattern matching foot collision geoms
+        com_body_name: Body name for COM offset tracking
+        entity_name: Name of the robot entity in the scene
+        robot_cfg: Optional RobotConfig for dimension parameterization.
+                   If None, uses G1 defaults for backward compatibility.
+    """
+    
+    def __init__(
+        self,
+        env,
+        foot_geom_regex: str,
+        com_body_name: str = "torso_link",
+        entity_name: str = "robot",
+        robot_cfg: "RobotConfig | None" = None,
+    ):
         self.env = env
         self.robot = env.scene[entity_name]
+        self.robot_cfg = robot_cfg
+        self.xi_dim = get_xi_dim(robot_cfg)
+        
         local_ids, names = self.robot.find_geoms(foot_geom_regex)
         if len(local_ids) == 0:
             raise ValueError(f"no geoms match {foot_geom_regex}")
@@ -22,6 +61,7 @@ class SimContext:
         )
 
     def read(self) -> torch.Tensor:
+        """Read simulation context: (N, xi_dim) = [friction(1), encoder_bias(nj), com_offset(3)]."""
         model = self.env.sim.model
         n = self.env.num_envs
         fr = model.geom_friction
@@ -36,5 +76,12 @@ class SimContext:
             com = (ipos[self.com_body_global] - self.com_nominal).expand(n, 3)
         bias = self.robot.data.encoder_bias
         xi = torch.cat([friction.reshape(n, 1), bias, com], dim=-1)
-        assert xi.shape == (n, XI_DIM)
+        
+        expected_dim = self.xi_dim
+        if xi.shape[-1] != expected_dim:
+            raise ValueError(
+                f"xi dimension mismatch: got {xi.shape[-1]}, expected {expected_dim}. "
+                f"Check that robot config num_joints ({self.robot_cfg.num_joints if self.robot_cfg else 29}) "
+                f"matches the simulation."
+            )
         return xi.clone()

@@ -14,8 +14,12 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
+
+if TYPE_CHECKING:
+    from supermimic.robot.robot_config import RobotConfig
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as base_mdp
 from mjlab.envs.mdp import dr
@@ -67,9 +71,33 @@ ROOT_BODY = "pelvis"
 FOOT_GEOM_REGEX = r"^(left|right)_foot[1-7]_collision$"
 
 
+def _get_robot_params(robot_cfg: "RobotConfig | None"):
+    """Get robot parameters from config or use G1 defaults."""
+    if robot_cfg is None:
+        return TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, FOOT_GEOM_REGEX, G1_ACTION_SCALE, "torso_link", get_g1_robot_cfg
+    return (
+        robot_cfg.tracked_body_names,
+        robot_cfg.anchor_body_name,
+        robot_cfg.root_body_name,
+        robot_cfg.foot_geom_regex,
+        robot_cfg.action_scale,
+        robot_cfg.com_body_name,
+        robot_cfg.get_robot_cfg_func(),
+    )
+
+
 @dataclass
 class SuperMimicEnvCfgArgs:
+    """Environment configuration arguments.
+    
+    Args:
+        npz_files: List of motion npz files
+        robot_cfg: Robot configuration. If None, uses G1 defaults.
+        inverted_mode: Enable handstand/inverted pose terminations instead of standing-only.
+    """
     npz_files: list[str]
+    robot_cfg: "RobotConfig | None" = None
+    inverted_mode: bool = False  # Enable handstand-friendly terminations
     num_envs: int = 4096
     future_frames: int = 10
     history_length: int = 10
@@ -93,6 +121,9 @@ class SuperMimicEnvCfgArgs:
 
 
 def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+    # Get robot-specific parameters
+    tracked_bodies, anchor_body, root_body, foot_geom_regex, action_scale, com_body, get_robot_cfg = _get_robot_params(a.robot_cfg)
+    
     # ---------------------------------------------------------------- observations
     noise = (lambda lo, hi: Unoise(n_min=lo, n_max=hi)) if a.obs_noise else (lambda lo, hi: None)
     policy_terms = {
@@ -132,7 +163,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "joint_pos": NoisyJointPositionActionCfg(
             entity_name="robot",
             actuator_names=(".*",),
-            scale=G1_ACTION_SCALE,
+            scale=action_scale,
             use_default_offset=True,
             noise_std=a.action_noise_std,
         )
@@ -144,9 +175,9 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     commands = {
         "motion": MultiClipMotionCommandCfg(
             npz_files=[str(f) for f in a.npz_files],
-            anchor_body_name=ANCHOR_BODY,
-            root_body_name=ROOT_BODY,
-            body_names=TRACKED_BODIES,
+            anchor_body_name=anchor_body,
+            root_body_name=root_body,
+            body_names=tracked_bodies,
             entity_name="robot",
             future_frames=a.future_frames,
             bin_frames=a.bin_frames,
@@ -167,7 +198,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="startup",
             func=dr.body_com_offset,
             params={
-                "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+                "asset_cfg": SceneEntityCfg("robot", body_names=(com_body,)),
                 "operation": "add",
                 "ranges": {0: (-0.025, 0.025), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
             },
@@ -181,7 +212,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="reset",
             func=dr.geom_friction,
             params={
-                "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_REGEX),
+                "asset_cfg": SceneEntityCfg("robot", geom_names=foot_geom_regex),
                 "operation": "abs",
                 "ranges": (0.3, 1.2),
                 "shared_random": True,
@@ -193,7 +224,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="startup",
             func=dr.geom_friction,
             params={
-                "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_REGEX),
+                "asset_cfg": SceneEntityCfg("robot", geom_names=foot_geom_regex),
                 "operation": "abs",
                 "ranges": (1.0, 1.0),
                 "shared_random": True,
@@ -216,16 +247,30 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     terminations = {
         "time_out": TerminationTermCfg(func=base_mdp.time_out, time_out=True),
         "clip_end": TerminationTermCfg(func=sm_term.clip_end, params={"command_name": "motion"}, time_out=True),
-        "root_height": TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold}),
-        "root_tilt": TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold}),
     }
+    
+    # Choose termination mode based on inverted_mode flag
+    if a.inverted_mode:
+        # Handstand-friendly terminations: use inverted contact tracking
+        terminations["inverted_contact"] = TerminationTermCfg(
+            func=sm_term.bad_inverted_contact,
+            params={
+                "command_name": "motion",
+                "height_threshold": a.root_height_threshold,
+                "tilt_threshold": a.root_tilt_threshold,
+            },
+        )
+    else:
+        # Standard standing terminations
+        terminations["root_height"] = TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold})
+        terminations["root_tilt"] = TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold})
 
     recorders = {}
     if a.record_transitions:
-        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
+        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": foot_geom_regex, "com_body_name": com_body})
 
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_robot_cfg()}),
         observations=observations,
         actions=actions,
         commands=commands,
@@ -233,7 +278,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         rewards=rewards,
         terminations=terminations,
         recorders=recorders,
-        viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name="torso_link", distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
+        viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name=com_body, distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
         sim=QuietSimulationCfg(nconmax=35, njmax=250, mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20)),
         decimation=4,
         episode_length_s=a.episode_length_s,
