@@ -1,4 +1,6 @@
-"""CSV (G1 retarget) -> mjlab-compatible motion npz, batch friendly.
+"""CSV (retarget) -> mjlab-compatible motion npz, batch friendly.
+
+Supports multiple robots via RobotConfig. Default is G1 for backward compatibility.
 
 Conventions mirror ``mjlab/scripts/csv_to_npz.py`` (commit 8bb2bc9) exactly, but
 everything is vectorised and the forward kinematics run on CPU MuJoCo instead of a
@@ -7,12 +9,12 @@ GPU Simulation so that hundreds of thousands of clips can be converted in parall
 CSV layout (no header, one row per frame):
   cols 0:3   root position (m)
   cols 3:7   root quaternion in **xyzw** order (converted to wxyz here)
-  cols 7:36  29 joint angles in :data:`G1_JOINT_NAMES` order
+  cols 7:7+nj  nj joint angles in robot's joint order
 
 Output npz keys (same as mjlab ``MotionLoader`` expects):
-  fps, joint_pos (T,29), joint_vel (T,29), body_pos_w (T,30,3), body_quat_w (T,30,4) wxyz,
-  body_lin_vel_w (T,30,3), body_ang_vel_w (T,30,3)
-plus extras: joint_names, body_names, source (str), input_fps.
+  fps, joint_pos (T,nj), joint_vel (T,nj), body_pos_w (T,nb,3), body_quat_w (T,nb,4) wxyz,
+  body_lin_vel_w (T,nb,3), body_ang_vel_w (T,nb,3)
+plus extras: joint_names, body_names, source (str), input_fps, robot_name.
 
 Velocity definitions (as in mjlab):
   * joint_vel and root linear velocity: ``np.gradient`` of the resampled signal.
@@ -27,10 +29,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
+
+if TYPE_CHECKING:
+    from supermimic.robots.config import RobotConfig
 
 G1_JOINT_NAMES: tuple[str, ...] = (
     "left_hip_pitch_joint",
@@ -79,6 +85,32 @@ def load_g1_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
     assert model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE, "first joint must be the free joint"
     assert tuple(names[1:]) == G1_JOINT_NAMES, f"joint order mismatch: {names[1:]}"
     assert model.nq == 7 + NUM_JOINTS and model.nv == 6 + NUM_JOINTS
+    return model
+
+
+def load_robot_model(robot_config: "RobotConfig") -> mujoco.MjModel:
+    """Load MuJoCo model for any robot from its config."""
+    mjcf_path = robot_config.get_mjcf_path()
+    if mjcf_path is None:
+        raise FileNotFoundError(
+            f"MJCF not found for robot '{robot_config.name}'. "
+            f"Set {robot_config.mjcf_path_env_var} environment variable."
+        )
+    model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+    names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
+    assert model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE, "first joint must be the free joint"
+    expected_joints = robot_config.joint_names
+    actual_joints = tuple(names[1:])
+    if actual_joints != expected_joints:
+        raise ValueError(
+            f"Joint order mismatch for {robot_config.name}.\n"
+            f"Expected: {expected_joints[:5]}...\n"
+            f"Got: {actual_joints[:5]}..."
+        )
+    expected_nq = 7 + robot_config.num_joints
+    expected_nv = 6 + robot_config.num_joints
+    assert model.nq == expected_nq and model.nv == expected_nv, \
+        f"nq/nv mismatch: expected ({expected_nq}, {expected_nv}), got ({model.nq}, {model.nv})"
     return model
 
 
@@ -304,16 +336,61 @@ def forward_kinematics(model: mujoco.MjModel, motion: ResampledMotion) -> BodySt
 # ----------------------------------------------------------------------------- end to end
 
 
+def load_csv_for_robot(
+    path: str | Path,
+    robot_config: "RobotConfig",
+) -> np.ndarray:
+    """Load a retarget CSV for any robot configuration.
+
+    Returns float64 (N, 7+nj) array in the layout:
+    root position (m), root quaternion **xyzw**, nj joint angles (rad).
+    """
+    import pandas as pd
+
+    nj = robot_config.num_joints
+    expected_cols = 7 + nj
+
+    df = pd.read_csv(path, header=None, dtype=np.float64)
+    arr = df.to_numpy()
+
+    if arr.ndim != 2 or arr.shape[1] != expected_cols:
+        raise ValueError(
+            f"{path}: expected (N, {expected_cols}) for {robot_config.name} "
+            f"with {nj} joints, got {arr.shape}"
+        )
+
+    return arr
+
+
 def convert_csv_to_npz(
     csv_path: str | Path,
     out_path: str | Path,
     input_fps: float,
     output_fps: float = 50.0,
     model: mujoco.MjModel | None = None,
+    robot_config: "RobotConfig | None" = None,
 ) -> dict:
-    """Convert one CSV to an mjlab-compatible npz. Returns a small summary dict."""
-    model = model or load_g1_model()
-    raw = load_csv(csv_path)
+    """Convert one CSV to an mjlab-compatible npz. Returns a small summary dict.
+
+    Args:
+        csv_path: Path to input CSV file.
+        out_path: Path to output npz file.
+        input_fps: Frame rate of the input CSV.
+        output_fps: Target frame rate (default 50 Hz).
+        model: Optional pre-loaded MuJoCo model.
+        robot_config: Optional RobotConfig. If None, defaults to G1.
+    """
+    if robot_config is not None:
+        model = model or load_robot_model(robot_config)
+        raw = load_csv_for_robot(csv_path, robot_config)
+        joint_names = robot_config.joint_names
+        robot_name = robot_config.name
+    else:
+        model = model or load_g1_model()
+        raw = load_csv(csv_path)
+        joint_names = G1_JOINT_NAMES
+        robot_name = "g1"
+
     motion = resample_motion(raw, input_fps, output_fps)
     bodies = forward_kinematics(model, motion)
     out_path = Path(out_path)
@@ -327,10 +404,11 @@ def convert_csv_to_npz(
         body_quat_w=bodies.quat_w.astype(np.float32),
         body_lin_vel_w=bodies.lin_vel_w.astype(np.float32),
         body_ang_vel_w=bodies.ang_vel_w.astype(np.float32),
-        joint_names=np.array(G1_JOINT_NAMES),
+        joint_names=np.array(joint_names),
         body_names=np.array(bodies.body_names),
         source=np.array(str(csv_path)),
         input_fps=np.array([input_fps], dtype=np.float32),
+        robot_name=np.array(robot_name),
     )
     return {
         "source": str(csv_path),
@@ -338,4 +416,5 @@ def convert_csv_to_npz(
         "input_frames": int(raw.shape[0]),
         "output_frames": motion.num_frames,
         "duration_s": (motion.num_frames - 1) / output_fps,
+        "robot_name": robot_name,
     }

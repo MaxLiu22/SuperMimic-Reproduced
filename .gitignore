@@ -13,3 +13,24 @@ wandb/
 .pytest_cache/
 .ruff_cache/
 experiments/**/outputs/
+
+# Robot model files (URDF/MJCF/meshes) - DO NOT COMMIT
+# These must remain local on AutoDL / user machines
+*.urdf
+*.mjcf
+*.stl
+*.obj
+*.dae
+*.mtl
+*.png
+*.jpg
+*.jpeg
+*.tga
+*.bmp
+meshes/
+assets/
+robots/*/urdf/
+robots/*/mjcf/
+robots/*/meshes/
+robots/*/textures/
+~/.supermimic/
