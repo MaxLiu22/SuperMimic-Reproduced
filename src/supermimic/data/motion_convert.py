@@ -1,4 +1,4 @@
-"""CSV (G1 retarget) -> mjlab-compatible motion npz, batch friendly.
+"""CSV -> mjlab-compatible motion npz, batch friendly.
 
 Conventions mirror ``mjlab/scripts/csv_to_npz.py`` (commit 8bb2bc9) exactly, but
 everything is vectorised and the forward kinematics run on CPU MuJoCo instead of a
@@ -7,11 +7,11 @@ GPU Simulation so that hundreds of thousands of clips can be converted in parall
 CSV layout (no header, one row per frame):
   cols 0:3   root position (m)
   cols 3:7   root quaternion in **xyzw** order (converted to wxyz here)
-  cols 7:36  29 joint angles in :data:`G1_JOINT_NAMES` order
+  cols 7:7+nj  joint angles in joint_names order
 
 Output npz keys (same as mjlab ``MotionLoader`` expects):
-  fps, joint_pos (T,29), joint_vel (T,29), body_pos_w (T,30,3), body_quat_w (T,30,4) wxyz,
-  body_lin_vel_w (T,30,3), body_ang_vel_w (T,30,3)
+  fps, joint_pos (T,nj), joint_vel (T,nj), body_pos_w (T,nb,3), body_quat_w (T,nb,4) wxyz,
+  body_lin_vel_w (T,nb,3), body_ang_vel_w (T,nb,3)
 plus extras: joint_names, body_names, source (str), input_fps.
 
 Velocity definitions (as in mjlab):
@@ -20,6 +20,8 @@ Velocity definitions (as in mjlab):
     expressed in the **world** frame, first/last sample repeated.
   * body link velocities: from MuJoCo ``cvel`` with
     ``lin_w = cvel_lin - ang x (subtree_com[root] - xpos)``, ``ang_w = cvel_ang``.
+
+This module now supports multiple robots via RobotConfig for dimension parameterization.
 """
 
 from __future__ import annotations
@@ -27,11 +29,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
+if TYPE_CHECKING:
+    from supermimic.robot.robot_config import RobotConfig
+
+# G1 joint names (kept for backward compatibility)
 G1_JOINT_NAMES: tuple[str, ...] = (
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -66,6 +73,20 @@ G1_JOINT_NAMES: tuple[str, ...] = (
 NUM_JOINTS = len(G1_JOINT_NAMES)
 
 
+def get_joint_names(robot_cfg: "RobotConfig | None" = None) -> tuple[str, ...]:
+    """Get joint names for a robot config."""
+    if robot_cfg is None:
+        return G1_JOINT_NAMES
+    return robot_cfg.joint_names
+
+
+def get_num_joints(robot_cfg: "RobotConfig | None" = None) -> int:
+    """Get number of joints for a robot config."""
+    if robot_cfg is None:
+        return NUM_JOINTS
+    return robot_cfg.num_joints
+
+
 def g1_xml_path() -> Path:
     import mjlab
 
@@ -79,6 +100,46 @@ def load_g1_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
     assert model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE, "first joint must be the free joint"
     assert tuple(names[1:]) == G1_JOINT_NAMES, f"joint order mismatch: {names[1:]}"
     assert model.nq == 7 + NUM_JOINTS and model.nv == 6 + NUM_JOINTS
+    return model
+
+
+def load_robot_model(robot_cfg: "RobotConfig") -> mujoco.MjModel:
+    """Load a MuJoCo model for any robot from its config.
+    
+    Args:
+        robot_cfg: Robot configuration with asset path
+    
+    Returns:
+        MuJoCo model
+    
+    Raises:
+        ValueError: If model dimensions don't match robot config
+    """
+    xml_path = robot_cfg.get_xml_path()
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    
+    names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
+    if model.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
+        raise ValueError("First joint must be a free joint (floating base)")
+    
+    expected_joint_names = robot_cfg.joint_names
+    actual_joint_names = tuple(names[1:])
+    if actual_joint_names != expected_joint_names:
+        raise ValueError(
+            f"Joint order mismatch for {robot_cfg.name}.\n"
+            f"Expected: {expected_joint_names[:5]}...\n"
+            f"Got: {actual_joint_names[:5]}..."
+        )
+    
+    expected_nq = robot_cfg.nq
+    expected_nv = robot_cfg.nv
+    if model.nq != expected_nq or model.nv != expected_nv:
+        raise ValueError(
+            f"Model dimensions mismatch for {robot_cfg.name}. "
+            f"Expected nq={expected_nq}, nv={expected_nv}, "
+            f"got nq={model.nq}, nv={model.nv}"
+        )
+    
     return model
 
 
@@ -137,14 +198,18 @@ class ResampledMotion:
     fps: float
     root_pos: np.ndarray  # (T,3)
     root_quat: np.ndarray  # (T,4) wxyz
-    joint_pos: np.ndarray  # (T,29)
+    joint_pos: np.ndarray  # (T,nj)
     root_lin_vel_w: np.ndarray  # (T,3) world
     root_ang_vel_w: np.ndarray  # (T,3) world
-    joint_vel: np.ndarray  # (T,29)
+    joint_vel: np.ndarray  # (T,nj)
 
     @property
     def num_frames(self) -> int:
         return int(self.root_pos.shape[0])
+    
+    @property
+    def num_joints(self) -> int:
+        return int(self.joint_pos.shape[1])
 
 
 BONES_HEADER_PREFIX = "Frame,root_translateX"
@@ -157,20 +222,33 @@ def csv_format(path: str | Path) -> str:
     return "bones" if first.startswith(BONES_HEADER_PREFIX) else "lafan1"
 
 
-def load_csv(path: str | Path) -> np.ndarray:
-    """Load a G1 retarget CSV in either format. Returns float64 (N, 36) in the LAFAN1 layout:
-    root position (m), root quaternion **xyzw**, 29 joint angles (rad) in G1_JOINT_NAMES order."""
+def load_csv(
+    path: str | Path,
+    robot_cfg: "RobotConfig | None" = None,
+) -> np.ndarray:
+    """Load a retarget CSV in either format.
+    
+    Args:
+        path: Path to CSV file
+        robot_cfg: Robot config for joint names/count. If None, uses G1 defaults.
+    
+    Returns:
+        float64 (N, 7+nj) in the LAFAN1 layout:
+        root position (m), root quaternion **xyzw**, joint angles (rad) in joint order.
+    """
     import pandas as pd
+    
+    joint_names = get_joint_names(robot_cfg)
+    num_joints = get_num_joints(robot_cfg)
 
     if csv_format(path) == "bones":
-        # BONES-SEED G1 CSV (same parsing as SONIC's convert_soma_csv_to_motion_lib.py):
-        # centimeters -> metres, Euler 'xyz' degrees -> quaternion, joint degrees -> radians.
+        # BONES-SEED CSV: centimeters -> metres, Euler 'xyz' degrees -> quaternion, joint degrees -> radians.
         df = pd.read_csv(path)
         cols = list(df.columns)
         joint_cols = [c for c in cols if c.endswith("_joint_dof")]
-        expected = [f"{n}_dof" for n in G1_JOINT_NAMES]
+        expected = [f"{n}_dof" for n in joint_names]
         if joint_cols != expected:
-            raise ValueError(f"{path}: joint columns differ from G1 order: {joint_cols[:5]}...")
+            raise ValueError(f"{path}: joint columns differ from expected order: {joint_cols[:5]}...")
         pos = df[["root_translateX", "root_translateY", "root_translateZ"]].to_numpy(np.float64) / 100.0
         eul = df[["root_rotateX", "root_rotateY", "root_rotateZ"]].to_numpy(np.float64)
         quat_xyzw = Rotation.from_euler("xyz", eul, degrees=True).as_quat()
@@ -178,8 +256,8 @@ def load_csv(path: str | Path) -> np.ndarray:
         arr = np.concatenate([pos, quat_xyzw, joints], axis=1)
     else:
         arr = pd.read_csv(path, header=None, dtype=np.float64).to_numpy()
-    if arr.ndim != 2 or arr.shape[1] != 7 + NUM_JOINTS:
-        raise ValueError(f"{path}: expected (N, {7 + NUM_JOINTS}) got {arr.shape}")
+    if arr.ndim != 2 or arr.shape[1] != 7 + num_joints:
+        raise ValueError(f"{path}: expected (N, {7 + num_joints}) got {arr.shape}")
     return arr
 
 
@@ -310,10 +388,29 @@ def convert_csv_to_npz(
     input_fps: float,
     output_fps: float = 50.0,
     model: mujoco.MjModel | None = None,
+    robot_cfg: "RobotConfig | None" = None,
 ) -> dict:
-    """Convert one CSV to an mjlab-compatible npz. Returns a small summary dict."""
-    model = model or load_g1_model()
-    raw = load_csv(csv_path)
+    """Convert one CSV to an mjlab-compatible npz. Returns a small summary dict.
+    
+    Args:
+        csv_path: Path to input CSV
+        out_path: Path to output npz
+        input_fps: Input motion FPS
+        output_fps: Output motion FPS (default: 50)
+        model: Pre-loaded MuJoCo model. If None, loaded from robot_cfg or G1 default.
+        robot_cfg: Robot configuration. If None, uses G1 defaults.
+    
+    Returns:
+        Summary dict with source, output path, frame counts, and duration.
+    """
+    if model is None:
+        if robot_cfg is not None:
+            model = load_robot_model(robot_cfg)
+        else:
+            model = load_g1_model()
+    
+    joint_names = get_joint_names(robot_cfg)
+    raw = load_csv(csv_path, robot_cfg)
     motion = resample_motion(raw, input_fps, output_fps)
     bodies = forward_kinematics(model, motion)
     out_path = Path(out_path)
@@ -327,7 +424,7 @@ def convert_csv_to_npz(
         body_quat_w=bodies.quat_w.astype(np.float32),
         body_lin_vel_w=bodies.lin_vel_w.astype(np.float32),
         body_ang_vel_w=bodies.ang_vel_w.astype(np.float32),
-        joint_names=np.array(G1_JOINT_NAMES),
+        joint_names=np.array(joint_names),
         body_names=np.array(bodies.body_names),
         source=np.array(str(csv_path)),
         input_fps=np.array([input_fps], dtype=np.float32),

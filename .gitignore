@@ -13,3 +13,20 @@ wandb/
 .pytest_cache/
 .ruff_cache/
 experiments/**/outputs/
+
+# Environment files with secrets/local paths
+.env
+.env.local
+.env.*
+
+# Robot model files (MUST NOT be committed)
+# Pi Plus and other proprietary robot assets
+*.urdf
+*.mjcf
+*.stl
+*.obj
+*.dae
+/robots/
+/assets/robots/
+**/piplus*/
+**/pi_plus*/

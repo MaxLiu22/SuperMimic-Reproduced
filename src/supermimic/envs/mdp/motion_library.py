@@ -7,31 +7,45 @@ environments index arbitrary clips and frames with plain gathers.
 Two storage modes:
 
 * **full** (small sets, e.g. LAFAN1): per frame we keep the reference joints, the pelvis
-  state and the world-frame link states of the *tracked* bodies, plus precomputed 68-d
+  state and the world-frame link states of the *tracked* bodies, plus precomputed
   goal features. ~1 KB/frame.
-* **compact** (BONES-SEED, 47.5M frames): per frame only the 71-d reference state
-  ``[root_pos(3), root_quat(4), joint_pos(29), root_lin_vel_w(3), root_ang_vel_w(3),
-  joint_vel(29)]`` in fp16/fp32 (284 B/frame in fp32); tracked-body states and goal
-  features are computed on the fly with the differentiable FK (plan 1.3).
+* **compact** (BONES-SEED, 47.5M frames): per frame only the ref_dim reference state
+  ``[root_pos(3), root_quat(4), joint_pos(nj), root_lin_vel_w(3), root_ang_vel_w(3),
+  joint_vel(nj)]`` in fp16/fp32; tracked-body states and goal features are computed
+  on the fly with the differentiable FK (plan 1.3).
 
-Goal features (per frame, 68-d, plan D5):
-  [joint_pos - q0 (29), joint_vel (29), projected gravity of the ref root (3),
+Goal features (per frame, goal_feat_dim, plan D5):
+  [joint_pos - q0 (nj), joint_vel (nj), projected gravity of the ref root (3),
    ref root angular velocity in the root frame (3),
    ref root linear velocity in the ref heading frame (3), ref root height (1)]
+
+Dimensions are now parameterized via RobotConfig for multi-robot support.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse, yaw_quat
 
-GOAL_FEAT_DIM = 68
-REF_DIM = 71
+if TYPE_CHECKING:
+    from supermimic.robot.robot_config import RobotConfig
+
+# Legacy constants for backward compatibility (G1 defaults)
+GOAL_FEAT_DIM = 68  # G1: 29*2 + 10 = 68
+REF_DIM = 71  # G1: 3 + 4 + 29 + 3 + 3 + 29 = 71
+
+
+def get_motion_dims(robot_cfg: "RobotConfig | None" = None) -> tuple[int, int]:
+    """Get (goal_feat_dim, ref_dim) for a robot config."""
+    if robot_cfg is None:
+        return GOAL_FEAT_DIM, REF_DIM
+    return robot_cfg.goal_feat_dim, robot_cfg.ref_dim
 
 
 @dataclass
@@ -49,10 +63,10 @@ class ClipInfo:
 class RefState:
     root_pos_w: torch.Tensor  # (N,3)
     root_quat_w: torch.Tensor  # (N,4) wxyz
-    joint_pos: torch.Tensor  # (N,29)
+    joint_pos: torch.Tensor  # (N,nj)
     root_lin_vel_w: torch.Tensor  # (N,3)
     root_ang_vel_w: torch.Tensor  # (N,3)
-    joint_vel: torch.Tensor  # (N,29)
+    joint_vel: torch.Tensor  # (N,nj)
 
 
 @dataclass
@@ -73,6 +87,22 @@ def goal_features(ref: RefState, default_joint_pos: torch.Tensor) -> torch.Tenso
 
 
 class MotionLibrary:
+    """Motion library with robot-parameterized dimensions.
+    
+    Args:
+        npz_files: List of motion npz files
+        body_names: Tuple of tracked body names
+        default_joint_pos: Default joint positions
+        device: torch device
+        dtype: torch dtype
+        bin_frames: Frames per bin for sampling
+        compact: Use compact mode (compute FK on the fly)
+        store_dtype: Storage dtype for reference states
+        robot_cfg: Optional RobotConfig for dimension parameterization.
+                   If None, uses G1 defaults for backward compatibility.
+        root_body_name: Root body name for npz parsing (default: "pelvis")
+    """
+    
     def __init__(
         self,
         npz_files: list[str | Path],
@@ -83,12 +113,31 @@ class MotionLibrary:
         bin_frames: int = 50,
         compact: bool = False,
         store_dtype: torch.dtype = torch.float16,
+        robot_cfg: "RobotConfig | None" = None,
+        root_body_name: str = "pelvis",
     ):
         self.device = torch.device(device)
         self.dtype = dtype
         self.body_names = tuple(body_names)
         self.bin_frames = int(bin_frames)
         self.compact = compact
+        self.robot_cfg = robot_cfg
+        self.root_body_name = root_body_name
+        
+        # Get dimensions from robot config or use defaults
+        self.goal_feat_dim, self.ref_dim = get_motion_dims(robot_cfg)
+        self.nj = robot_cfg.num_joints if robot_cfg else 29
+        
+        # Compute slice indices for reference state
+        self._joint_pos_start = 7
+        self._joint_pos_end = 7 + self.nj
+        self._root_lin_vel_start = 7 + self.nj
+        self._root_lin_vel_end = 7 + self.nj + 3
+        self._root_ang_vel_start = 7 + self.nj + 3
+        self._root_ang_vel_end = 7 + self.nj + 6
+        self._joint_vel_start = 7 + self.nj + 6
+        self._joint_vel_end = 7 + self.nj + 6 + self.nj  # == ref_dim
+        
         if len(npz_files) == 0:
             raise ValueError("MotionLibrary needs at least one clip")
         if isinstance(default_joint_pos, torch.Tensor):
@@ -115,7 +164,7 @@ class MotionLibrary:
                 if body_idx is None:
                     names = [str(n) for n in d["body_names"]]
                     body_idx = np.array([names.index(n) for n in self.body_names])
-                    root_idx = names.index("pelvis")
+                    root_idx = names.index(root_body_name)
                 n = int(d["joint_pos"].shape[0])
                 bp, bq, blv, bav = d["body_pos_w"], d["body_quat_w"], d["body_lin_vel_w"], d["body_ang_vel_w"]
                 ref = np.concatenate(
@@ -135,7 +184,12 @@ class MotionLibrary:
 
         if ref_chunks is not None:
             ref_np = np.concatenate(ref_chunks, 0)
-            assert ref_np.shape[1] == REF_DIM
+            expected_ref_dim = self.ref_dim
+            if ref_np.shape[1] != expected_ref_dim:
+                raise ValueError(
+                    f"Motion data ref_dim ({ref_np.shape[1]}) doesn't match robot config ({expected_ref_dim}). "
+                    f"Check that motion data was generated for the correct robot."
+                )
             self._ref = torch.as_tensor(ref_np, device=self.device, dtype=store_dtype if compact else dtype)
             del ref_np, ref_chunks
         if not compact:
@@ -147,11 +201,7 @@ class MotionLibrary:
             del body_chunks
             self.goal_feat = goal_features(self._split(self._ref), q0)
         else:
-            from supermimic.data.motion_convert import load_g1_model
-            from supermimic.kinematics.g1_fk import G1Kinematics
-
-            self._fk = G1Kinematics(load_g1_model(), device=self.device, dtype=dtype)
-            self._tracked_idx = self._fk.body_indices(self.body_names)
+            self._init_compact_fk()
 
         self.clip_start = torch.tensor([c.start for c in clips], device=self.device, dtype=torch.long)
         self.clip_len = torch.tensor([c.length for c in clips], device=self.device, dtype=torch.long)
@@ -166,18 +216,47 @@ class MotionLibrary:
         self.bin_start = self.clip_start[bin_clip] + local_bin * self.bin_frames
         self.bin_end = torch.minimum(self.bin_start + self.bin_frames, self.clip_start[bin_clip] + self.clip_len[bin_clip])
         self.bin_clip = bin_clip
+    
+    def _init_compact_fk(self):
+        """Initialize FK for compact mode based on robot config."""
+        if self.robot_cfg is not None:
+            from supermimic.kinematics.robot_fk import create_robot_kinematics
+            self._fk = create_robot_kinematics(self.robot_cfg, device=self.device, dtype=self.dtype)
+        else:
+            # Legacy G1 path
+            from supermimic.data.motion_convert import load_g1_model
+            from supermimic.kinematics.g1_fk import G1Kinematics
+            self._fk = G1Kinematics(load_g1_model(), device=self.device, dtype=self.dtype)
+        self._tracked_idx = self._fk.body_indices(self.body_names)
 
     # ------------------------------------------------------------------ per-frame access
 
+    def _split(self, r: torch.Tensor) -> RefState:
+        """Split reference tensor into components using parameterized indices."""
+        return RefState(
+            r[..., 0:3],
+            r[..., 3:7],
+            r[..., self._joint_pos_start:self._joint_pos_end],
+            r[..., self._root_lin_vel_start:self._root_lin_vel_end],
+            r[..., self._root_ang_vel_start:self._root_ang_vel_end],
+            r[..., self._joint_vel_start:self._joint_vel_end],
+        )
+    
     @staticmethod
-    def _split(r: torch.Tensor) -> RefState:
+    def _split_g1(r: torch.Tensor) -> RefState:
+        """Legacy static split for G1 (29 joints). Use _split() method for robot-agnostic code."""
         return RefState(r[..., 0:3], r[..., 3:7], r[..., 7:36], r[..., 36:39], r[..., 39:42], r[..., 42:71])
 
     def ref(self, frame: torch.Tensor) -> RefState:
         return self._split(self._ref[frame].to(self.dtype))
 
-    def ref71(self, frame: torch.Tensor) -> torch.Tensor:
+    def ref_state(self, frame: torch.Tensor) -> torch.Tensor:
+        """Return reference state tensor (N, ref_dim). Renamed from ref71 for clarity."""
         return self._ref[frame].to(self.dtype)
+    
+    def ref71(self, frame: torch.Tensor) -> torch.Tensor:
+        """Legacy alias for ref_state. Use ref_state() for robot-agnostic code."""
+        return self.ref_state(frame)
 
     def bodies(self, frame: torch.Tensor) -> RefBodies:
         """Tracked-body link states (world) at the given frames."""
@@ -200,19 +279,19 @@ class MotionLibrary:
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self._ref[:, 7:36].to(self.dtype)
+        return self._ref[:, self._joint_pos_start:self._joint_pos_end].to(self.dtype)
 
     @property
     def root_lin_vel_w(self) -> torch.Tensor:
-        return self._ref[:, 36:39].to(self.dtype)
+        return self._ref[:, self._root_lin_vel_start:self._root_lin_vel_end].to(self.dtype)
 
     @property
     def root_ang_vel_w(self) -> torch.Tensor:
-        return self._ref[:, 39:42].to(self.dtype)
+        return self._ref[:, self._root_ang_vel_start:self._root_ang_vel_end].to(self.dtype)
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self._ref[:, 42:71].to(self.dtype)
+        return self._ref[:, self._joint_vel_start:self._joint_vel_end].to(self.dtype)
 
     # ------------------------------------------------------------------ queries
 
@@ -224,14 +303,14 @@ class MotionLibrary:
         return self.clip_last[self.frame_clip[frame]]
 
     def goal_window(self, frame: torch.Tensor, k: int) -> torch.Tensor:
-        """(N, k*68) goal features of frames frame..frame+k-1, clamped at the clip end."""
+        """(N, k*goal_feat_dim) goal features of frames frame..frame+k-1, clamped at the clip end."""
         last = self.last_frame_of(frame)
         offs = torch.arange(k, device=self.device)
         idx = torch.minimum(frame[:, None] + offs[None, :], last[:, None])  # (N,k)
         if not self.compact:
-            return self.goal_feat[idx].reshape(frame.shape[0], k * GOAL_FEAT_DIM)
+            return self.goal_feat[idx].reshape(frame.shape[0], k * self.goal_feat_dim)
         feat = goal_features(self.ref(idx.reshape(-1)), self.default_joint_pos)
-        return feat.reshape(frame.shape[0], k * GOAL_FEAT_DIM)
+        return feat.reshape(frame.shape[0], k * self.goal_feat_dim)
 
     def ref_qpos_qvel(self, frame: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """MuJoCo-layout reference state: qpos (N,36) and qvel (N,35; root ang vel in body frame)."""
