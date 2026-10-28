@@ -1,5 +1,7 @@
 """SuperMimic tracking environment on mjlab (plan Phase 2.3).
 
+Supports multiple robot configurations (G1, Pi Plus) via the robot abstraction layer.
+
 Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``):
   * observations: paper Table A.1 proprioception only (no anchor pose, no base lin vel),
     10-frame history (term-major), plus a separate ``goal`` group with K future frames;
@@ -13,9 +15,10 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from typing import Literal
 
-from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as base_mdp
 from mjlab.envs.mdp import dr
@@ -36,6 +39,8 @@ from supermimic.envs.actions import NoisyJointPositionActionCfg
 from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
+from supermimic.robots import RobotConfig, get_robot_config
+
 
 class QuietSimulationCfg(SimulationCfg):
     """SimulationCfg that disables MuJoCo Warp's per-step overflow printf (a kernel build-time constant,
@@ -46,29 +51,29 @@ class QuietSimulationCfg(SimulationCfg):
         wp_opt.warn_overflow = 0
 
 
-TRACKED_BODIES = (
-    "pelvis",
-    "left_hip_roll_link",
-    "left_knee_link",
-    "left_ankle_roll_link",
-    "right_hip_roll_link",
-    "right_knee_link",
-    "right_ankle_roll_link",
-    "torso_link",
-    "left_shoulder_roll_link",
-    "left_elbow_link",
-    "left_wrist_yaw_link",
-    "right_shoulder_roll_link",
-    "right_elbow_link",
-    "right_wrist_yaw_link",
-)
-ANCHOR_BODY = "torso_link"
-ROOT_BODY = "pelvis"
-FOOT_GEOM_REGEX = r"^(left|right)_foot[1-7]_collision$"
+def get_robot_cfg_from_mjlab(robot_name: str):
+    """Get mjlab robot config for known robots, or raise for custom robots."""
+    if robot_name == "g1":
+        from mjlab.asset_zoo.robots import get_g1_robot_cfg
+        return get_g1_robot_cfg()
+    else:
+        # For other robots (like pi_plus), the user must provide the MJCF
+        # mjlab doesn't have built-in configs for them
+        raise ValueError(
+            f"Robot '{robot_name}' is not available in mjlab. "
+            f"For custom robots, use 'custom' robot_name and provide mjcf_path."
+        )
+
+
+def get_action_scale(robot_cfg: RobotConfig) -> tuple[float, ...]:
+    """Get action scale for the robot."""
+    return robot_cfg.action_scale
 
 
 @dataclass
 class SuperMimicEnvCfgArgs:
+    """Configuration arguments for SuperMimic environment."""
+    
     npz_files: list[str]
     num_envs: int = 4096
     future_frames: int = 10
@@ -90,9 +95,52 @@ class SuperMimicEnvCfgArgs:
     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
     extra_command_kwargs: dict = field(default_factory=dict)
+    
+    # Robot configuration
+    robot_name: str = "g1"  # 'g1', 'pi_plus', or 'custom'
+    mjcf_path: str | None = None  # Required for custom robots or to override default
+    
+    # Pose mode for terminations
+    pose_mode: Literal["standing", "handstand", "reference"] = "reference"
+
+
+def _get_tracked_bodies(robot_cfg: RobotConfig) -> tuple[str, ...]:
+    """Get tracked bodies from robot config."""
+    return robot_cfg.tracked_bodies
+
+
+def _get_anchor_body(robot_cfg: RobotConfig) -> str:
+    """Get anchor body from robot config."""
+    return robot_cfg.anchor_body
+
+
+def _get_root_body(robot_cfg: RobotConfig) -> str:
+    """Get root body from robot config."""
+    return robot_cfg.root_body
+
+
+def _get_foot_geom_regex(robot_cfg: RobotConfig) -> str:
+    """Get foot geom regex from robot config."""
+    return robot_cfg.foot_geom_regex
 
 
 def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+    """Create environment configuration.
+    
+    Args:
+        a: Environment configuration arguments.
+        
+    Returns:
+        ManagerBasedRlEnvCfg ready to be used with ManagerBasedRlEnv.
+    """
+    # Get robot configuration
+    robot_cfg = get_robot_config(a.robot_name)
+    tracked_bodies = _get_tracked_bodies(robot_cfg)
+    anchor_body = _get_anchor_body(robot_cfg)
+    root_body = _get_root_body(robot_cfg)
+    foot_geom_regex = _get_foot_geom_regex(robot_cfg)
+    action_scale = get_action_scale(robot_cfg)
+    
     # ---------------------------------------------------------------- observations
     noise = (lambda lo, hi: Unoise(n_min=lo, n_max=hi)) if a.obs_noise else (lambda lo, hi: None)
     policy_terms = {
@@ -132,7 +180,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "joint_pos": NoisyJointPositionActionCfg(
             entity_name="robot",
             actuator_names=(".*",),
-            scale=G1_ACTION_SCALE,
+            scale=action_scale,
             use_default_offset=True,
             noise_std=a.action_noise_std,
         )
@@ -144,9 +192,9 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     commands = {
         "motion": MultiClipMotionCommandCfg(
             npz_files=[str(f) for f in a.npz_files],
-            anchor_body_name=ANCHOR_BODY,
-            root_body_name=ROOT_BODY,
-            body_names=TRACKED_BODIES,
+            anchor_body_name=anchor_body,
+            root_body_name=root_body,
+            body_names=tracked_bodies,
             entity_name="robot",
             future_frames=a.future_frames,
             bin_frames=a.bin_frames,
@@ -167,7 +215,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="startup",
             func=dr.body_com_offset,
             params={
-                "asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+                "asset_cfg": SceneEntityCfg("robot", body_names=(anchor_body,)),
                 "operation": "add",
                 "ranges": {0: (-0.025, 0.025), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
             },
@@ -181,7 +229,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="reset",
             func=dr.geom_friction,
             params={
-                "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_REGEX),
+                "asset_cfg": SceneEntityCfg("robot", geom_names=foot_geom_regex),
                 "operation": "abs",
                 "ranges": (0.3, 1.2),
                 "shared_random": True,
@@ -193,7 +241,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             mode="startup",
             func=dr.geom_friction,
             params={
-                "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_REGEX),
+                "asset_cfg": SceneEntityCfg("robot", geom_names=foot_geom_regex),
                 "operation": "abs",
                 "ranges": (1.0, 1.0),
                 "shared_random": True,
@@ -216,16 +264,39 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     terminations = {
         "time_out": TerminationTermCfg(func=base_mdp.time_out, time_out=True),
         "clip_end": TerminationTermCfg(func=sm_term.clip_end, params={"command_name": "motion"}, time_out=True),
-        "root_height": TerminationTermCfg(func=sm_term.bad_root_height, params={"command_name": "motion", "threshold": a.root_height_threshold}),
-        "root_tilt": TerminationTermCfg(func=sm_term.bad_root_tilt, params={"command_name": "motion", "threshold": a.root_tilt_threshold}),
+        "root_height": TerminationTermCfg(
+            func=sm_term.bad_root_height,
+            params={"command_name": "motion", "threshold": a.root_height_threshold, "mode": a.pose_mode},
+        ),
+        "root_tilt": TerminationTermCfg(
+            func=sm_term.bad_root_tilt,
+            params={"command_name": "motion", "threshold": a.root_tilt_threshold, "mode": a.pose_mode},
+        ),
     }
 
     recorders = {}
     if a.record_transitions:
-        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
+        recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": foot_geom_regex, "com_body_name": anchor_body})
+
+    # Get robot scene entity config
+    if a.robot_name == "g1":
+        from mjlab.asset_zoo.robots import get_g1_robot_cfg
+        robot_scene_cfg = get_g1_robot_cfg()
+    else:
+        # For custom robots, we need to create a minimal config
+        # The user is responsible for providing the MJCF path
+        from mjlab.entity import ArticulationCfg
+        
+        mjcf_path = a.mjcf_path or robot_cfg.resolve_mjcf_path()
+        robot_scene_cfg = ArticulationCfg(
+            prim_path="/World/Robot",
+            spawn_type="mjcf",
+            mjcf_path=str(mjcf_path),
+            actuator_names=(".*",),
+        )
 
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": robot_scene_cfg}),
         observations=observations,
         actions=actions,
         commands=commands,
@@ -233,7 +304,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         rewards=rewards,
         terminations=terminations,
         recorders=recorders,
-        viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name="torso_link", distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
+        viewer=ViewerConfig(origin_type=ViewerConfig.OriginType.ASSET_BODY, entity_name="robot", body_name=anchor_body, distance=2.8, fovy=55.0, elevation=-5.0, azimuth=120.0),
         sim=QuietSimulationCfg(nconmax=35, njmax=250, mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20)),
         decimation=4,
         episode_length_s=a.episode_length_s,
@@ -243,7 +314,79 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
 
 
 def make_env(a: SuperMimicEnvCfgArgs, device: str = "cuda:0") -> ManagerBasedRlEnv:
+    """Create the SuperMimic tracking environment.
+    
+    Args:
+        a: Environment configuration arguments.
+        device: PyTorch device string.
+        
+    Returns:
+        Configured ManagerBasedRlEnv instance.
+    """
     from mjlab.utils.torch import configure_torch_backends
 
     configure_torch_backends()
     return ManagerBasedRlEnv(make_env_cfg(a), device=device)
+
+
+# =============================================================================
+# Convenience functions for handstand MVP
+# =============================================================================
+
+def make_handstand_env_cfg(
+    npz_files: list[str],
+    robot_name: str = "pi_plus",
+    mjcf_path: str | None = None,
+    num_envs: int = 4096,
+    **kwargs,
+) -> ManagerBasedRlEnvCfg:
+    """Create environment configuration for handstand training.
+    
+    This is a convenience function that sets up the environment with
+    handstand-appropriate defaults:
+    - pose_mode="handstand" (disables standing-only terminations)
+    - Increased root height threshold
+    - Motion reference-relative terminations
+    
+    Args:
+        npz_files: List of handstand motion npz files.
+        robot_name: Robot config name (default: 'pi_plus').
+        mjcf_path: Optional MJCF path override.
+        num_envs: Number of parallel environments.
+        **kwargs: Additional arguments passed to SuperMimicEnvCfgArgs.
+        
+    Returns:
+        ManagerBasedRlEnvCfg configured for handstand training.
+    """
+    # Get robot config for thresholds
+    robot_cfg = get_robot_config(robot_name)
+    
+    args = SuperMimicEnvCfgArgs(
+        npz_files=npz_files,
+        num_envs=num_envs,
+        robot_name=robot_name,
+        mjcf_path=mjcf_path,
+        pose_mode="handstand",
+        root_height_threshold=robot_cfg.root_height_threshold,
+        root_tilt_threshold=robot_cfg.root_tilt_threshold,
+        **kwargs,
+    )
+    return make_env_cfg(args)
+
+
+def make_handstand_env(
+    npz_files: list[str],
+    robot_name: str = "pi_plus",
+    mjcf_path: str | None = None,
+    device: str = "cuda:0",
+    **kwargs,
+) -> ManagerBasedRlEnv:
+    """Create environment for handstand training.
+    
+    See make_handstand_env_cfg for details.
+    """
+    from mjlab.utils.torch import configure_torch_backends
+
+    configure_torch_backends()
+    cfg = make_handstand_env_cfg(npz_files, robot_name, mjcf_path, **kwargs)
+    return ManagerBasedRlEnv(cfg, device=device)

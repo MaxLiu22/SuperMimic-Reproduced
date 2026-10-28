@@ -1,4 +1,9 @@
-"""CSV (G1 retarget) -> mjlab-compatible motion npz, batch friendly.
+"""CSV (retarget) -> mjlab-compatible motion npz, batch friendly.
+
+Supports multiple robots via configurable MJCF paths:
+- Unitree G1 (29 joints, mjlab default or SUPERMIMIC_G1_MJCF env var)
+- HighTorque Pi Plus (22 joints, SUPERMIMIC_PI_PLUS_MJCF env var)
+- Other humanoids via custom MJCF
 
 Conventions mirror ``mjlab/scripts/csv_to_npz.py`` (commit 8bb2bc9) exactly, but
 everything is vectorised and the forward kinematics run on CPU MuJoCo instead of a
@@ -7,11 +12,11 @@ GPU Simulation so that hundreds of thousands of clips can be converted in parall
 CSV layout (no header, one row per frame):
   cols 0:3   root position (m)
   cols 3:7   root quaternion in **xyzw** order (converted to wxyz here)
-  cols 7:36  29 joint angles in :data:`G1_JOINT_NAMES` order
+  cols 7:7+nj  joint angles in robot joint order
 
 Output npz keys (same as mjlab ``MotionLoader`` expects):
-  fps, joint_pos (T,29), joint_vel (T,29), body_pos_w (T,30,3), body_quat_w (T,30,4) wxyz,
-  body_lin_vel_w (T,30,3), body_ang_vel_w (T,30,3)
+  fps, joint_pos (T,nj), joint_vel (T,nj), body_pos_w (T,nb,3), body_quat_w (T,nb,4) wxyz,
+  body_lin_vel_w (T,nb,3), body_ang_vel_w (T,nb,3)
 plus extras: joint_names, body_names, source (str), input_fps.
 
 Velocity definitions (as in mjlab):
@@ -25,6 +30,7 @@ Velocity definitions (as in mjlab):
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,9 +73,17 @@ NUM_JOINTS = len(G1_JOINT_NAMES)
 
 
 def g1_xml_path() -> Path:
-    import mjlab
-
-    return Path(mjlab.__file__).parent / "asset_zoo/robots/unitree_g1/xmls/g1.xml"
+    """Get G1 MJCF path from env var or mjlab default."""
+    env_path = os.environ.get("SUPERMIMIC_G1_MJCF")
+    if env_path:
+        return Path(env_path)
+    try:
+        import mjlab
+        return Path(mjlab.__file__).parent / "asset_zoo/robots/unitree_g1/xmls/g1.xml"
+    except ImportError:
+        raise FileNotFoundError(
+            "G1 MJCF not found. Either install mjlab or set SUPERMIMIC_G1_MJCF environment variable."
+        )
 
 
 def load_g1_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
@@ -80,6 +94,44 @@ def load_g1_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
     assert tuple(names[1:]) == G1_JOINT_NAMES, f"joint order mismatch: {names[1:]}"
     assert model.nq == 7 + NUM_JOINTS and model.nv == 6 + NUM_JOINTS
     return model
+
+
+def load_robot_model(robot_name: str | None = None, mjcf_path: str | Path | None = None) -> mujoco.MjModel:
+    """Load a robot MuJoCo model.
+    
+    Args:
+        robot_name: Robot config name ('g1', 'pi_plus', etc.). Falls back to 
+                   SUPERMIMIC_ROBOT env var or 'g1'.
+        mjcf_path: Explicit MJCF path. Overrides robot_name.
+    
+    Returns:
+        MuJoCo model for the robot.
+        
+    Raises:
+        FileNotFoundError: If the MJCF file cannot be found.
+    """
+    if mjcf_path is not None:
+        return mujoco.MjModel.from_xml_path(str(mjcf_path))
+    
+    robot_name = robot_name or os.environ.get("SUPERMIMIC_ROBOT", "g1")
+    
+    if robot_name == "g1":
+        return load_g1_model()
+    else:
+        # Use robot config to resolve path
+        from supermimic.robots import get_robot_config
+        config = get_robot_config(robot_name)
+        path = config.resolve_mjcf_path()
+        return mujoco.MjModel.from_xml_path(str(path))
+
+
+def get_joint_names_from_model(model: mujoco.MjModel) -> tuple[str, ...]:
+    """Extract joint names from a MuJoCo model (excludes free joint)."""
+    names = []
+    for i in range(model.njnt):
+        if model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE:
+            names.append(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i))
+    return tuple(names)
 
 
 # ----------------------------------------------------------------------------- quaternions

@@ -13,3 +13,12 @@ wandb/
 .pytest_cache/
 .ruff_cache/
 experiments/**/outputs/
+
+# Robot model assets (NEVER commit proprietary geometry)
+*.urdf
+*.mjcf
+*.stl
+*.obj
+*.dae
+meshes/
+assets/robots/
