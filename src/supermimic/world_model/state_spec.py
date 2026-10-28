@@ -1,26 +1,27 @@
 """State representation for the world model (plan D1–D3).
 
-Simulator state  s = [root_pos(3), root_quat wxyz(4), joint_pos(29), root_lin_vel_w(3),
-                      root_ang_vel_b(3), joint_vel(29)]            (71, MuJoCo layout, origin-free)
+Simulator state  s = [root_pos(3), root_quat wxyz(4), joint_pos(nj), root_lin_vel_w(3),
+                      root_ang_vel_b(3), joint_vel(nj)]            (7 + 2*nj, MuJoCo layout, origin-free)
 
-Canonical features (network input, heading-invariant, 71):
+Canonical features (network input, heading-invariant, 7 + 2*nj):
     [root_z(1), rot6d(heading^-1 ⊗ root_quat)(6), root_lin_vel in heading frame(3),
-     root_ang_vel_b(3), joint_pos(29), joint_vel(29)]
+     root_ang_vel_b(3), joint_pos(nj), joint_vel(nj)]
 
-Network output ``delta`` (70) and the integration step (dt = 0.02 s):
-    dv_h(3), dw_b(3), dqd(29)            velocity increments, heading / body frame
-    dp_h(3), dth_b(3), dq(29)            position corrections on top of explicit integration
+Network output ``delta`` (6 + 2*nj) and the integration step (dt = 0.02 s):
+    dv_h(3), dw_b(3), dqd(nj)            velocity increments, heading / body frame
+    dp_h(3), dth_b(3), dq(nj)            position corrections on top of explicit integration
     v'  = v + R_h dv_h               w' = w + dw_b          qd' = qd + dqd
     p'  = p + dt v' + R_h dp_h       q' = q ⊗ exp(dt w' + dth_b)    qj' = qj + dt qd' + dq
 With zero output the model extrapolates at constant velocity (a physical prior); the
 last layer of the dynamics MLP is zero-initialised so training starts from it.
 
 Loss / error normalisation (D3): per-quantity nominal scales sigma applied to the
-70-d error vector [dp(3), rotvec(3), dv(3), dw(3), dq(29), dqd(29)].
+error vector [dp(3), rotvec(3), dv(3), dw(3), dq(nj), dqd(nj)].
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -37,14 +38,32 @@ from supermimic.kinematics.rotations import (
     rotvec_from_quat,
 )
 
-STATE_DIM = 71
-FEAT_DIM = 71
-DELTA_DIM = 70
+
+def compute_state_dim(num_joints: int) -> int:
+    """Compute state dimension: 7 + 2*nj (root pos 3 + quat 4 + joints*2)."""
+    return 7 + 2 * num_joints
+
+
+def compute_feat_dim(num_joints: int) -> int:
+    """Compute feature dimension: same as state dim."""
+    return 7 + 2 * num_joints
+
+
+def compute_delta_dim(num_joints: int) -> int:
+    """Compute delta dimension: 6 + 2*nj."""
+    return 6 + 2 * num_joints
+
+
+# Default values for G1 (29 joints) - kept for backwards compatibility
+STATE_DIM = 71  # 7 + 2*29
+FEAT_DIM = 71   # same as state
+DELTA_DIM = 70  # 6 + 2*29
 NJ = 29
 
 
 @dataclass
 class StateSpecCfg:
+    num_joints: int = 29  # Number of actuated joints
     dt: float = 0.02
     # Nominal error scales (D3) for [root pos m, root rotvec rad, root lin vel m/s, root ang vel rad/s, joint pos rad, joint vel rad/s].
     err_scale: tuple[float, ...] = (0.05, 0.1, 0.5, 1.0, 0.1, 2.0)
@@ -54,29 +73,53 @@ class StateSpecCfg:
     in_scale: tuple[float, ...] = (1.0, 1.0, 1.0, 2.0, 1.0, 5.0)
     explicit_integration: bool = True
     # xi normalisation: (offset, scale) for friction, encoder bias, com offset.
-    xi_offset: tuple[float, ...] = field(default_factory=lambda: (0.75,) + (0.0,) * 29 + (0.0,) * 3)
-    xi_scale: tuple[float, ...] = field(default_factory=lambda: (0.45,) + (0.01,) * 29 + (0.05,) * 3)
+    # These need to be dynamically sized based on num_joints
+    xi_offset: tuple[float, ...] | None = None
+    xi_scale: tuple[float, ...] | None = None
+    
+    def __post_init__(self):
+        nj = self.num_joints
+        if self.xi_offset is None:
+            self.xi_offset = (0.75,) + (0.0,) * nj + (0.0,) * 3
+        if self.xi_scale is None:
+            self.xi_scale = (0.45,) + (0.01,) * nj + (0.05,) * 3
 
 
 class StateSpec:
     def __init__(self, cfg: StateSpecCfg, device, dtype=torch.float32):
         self.cfg = cfg
         self.dt = cfg.dt
+        self.num_joints = cfg.num_joints
+        nj = cfg.num_joints
+        
+        # Compute dimensions
+        self.state_dim = compute_state_dim(nj)
+        self.feat_dim = compute_feat_dim(nj)
+        self.delta_dim = compute_delta_dim(nj)
+        
         rep = lambda scales, sizes: torch.cat([torch.full((n,), float(s)) for s, n in zip(scales, sizes)])  # noqa: E731
-        self.err_scale = rep(cfg.err_scale, (3, 3, 3, 3, NJ, NJ)).to(device=device, dtype=dtype)
-        self.out_scale = rep(cfg.out_scale, (3, 3, NJ, 3, 3, NJ)).to(device=device, dtype=dtype)
-        self.in_scale = rep(cfg.in_scale, (1, 6, 3, 3, NJ, NJ)).to(device=device, dtype=dtype)
+        self.err_scale = rep(cfg.err_scale, (3, 3, 3, 3, nj, nj)).to(device=device, dtype=dtype)
+        self.out_scale = rep(cfg.out_scale, (3, 3, nj, 3, 3, nj)).to(device=device, dtype=dtype)
+        self.in_scale = rep(cfg.in_scale, (1, 6, 3, 3, nj, nj)).to(device=device, dtype=dtype)
         self.xi_offset = torch.tensor(cfg.xi_offset, device=device, dtype=dtype)
         self.xi_scale = torch.tensor(cfg.xi_scale, device=device, dtype=dtype)
 
     # ------------------------------------------------------------------ split / features
 
-    @staticmethod
-    def split(s: torch.Tensor):
-        return s[..., 0:3], s[..., 3:7], s[..., 7:36], s[..., 36:39], s[..., 39:42], s[..., 42:71]
+    def split(self, s: torch.Tensor):
+        """Split state tensor into components."""
+        nj = self.num_joints
+        return (
+            s[..., 0:3],                      # root_pos
+            s[..., 3:7],                      # root_quat
+            s[..., 7:7+nj],                   # joint_pos
+            s[..., 7+nj:10+nj],               # root_lin_vel
+            s[..., 10+nj:13+nj],              # root_ang_vel
+            s[..., 13+nj:13+2*nj],            # joint_vel
+        )
 
     def canonical(self, s: torch.Tensor) -> torch.Tensor:
-        """Heading-invariant, scaled network input features (…, 71)."""
+        """Heading-invariant, scaled network input features (…, feat_dim)."""
         p, q, qj, v, w, qd = self.split(s)
         q = quat_normalize(q)
         hq = heading_quat(q)
@@ -91,9 +134,16 @@ class StateSpec:
     # ------------------------------------------------------------------ integration
 
     def integrate(self, s: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
-        """Apply the (unscaled) network output ``delta`` (…, 70) to state ``s`` (…, 71)."""
+        """Apply the (unscaled) network output ``delta`` (…, delta_dim) to state ``s`` (…, state_dim)."""
+        nj = self.num_joints
         d = delta * self.out_scale
-        dv_h, dw_b, dqd, dp_h, dth_b, dq = d[..., 0:3], d[..., 3:6], d[..., 6:35], d[..., 35:38], d[..., 38:41], d[..., 41:70]
+        dv_h = d[..., 0:3]
+        dw_b = d[..., 3:6]
+        dqd = d[..., 6:6+nj]
+        dp_h = d[..., 6+nj:9+nj]
+        dth_b = d[..., 9+nj:12+nj]
+        dq = d[..., 12+nj:12+2*nj]
+        
         p, q, qj, v, w, qd = self.split(s)
         q = quat_normalize(q)
         hq = heading_quat(q)
@@ -109,7 +159,7 @@ class StateSpec:
     # ------------------------------------------------------------------ errors
 
     def error_vector(self, s_pred: torch.Tensor, s_true: torch.Tensor) -> torch.Tensor:
-        """Normalised 70-d error [dp, rotvec, dv, dw, dq, dqd] / sigma."""
+        """Normalised error [dp, rotvec, dv, dw, dq, dqd] / sigma."""
         p1, q1, qj1, v1, w1, qd1 = self.split(s_pred)
         p2, q2, qj2, v2, w2, qd2 = self.split(s_true)
         q1 = quat_normalize(q1)
